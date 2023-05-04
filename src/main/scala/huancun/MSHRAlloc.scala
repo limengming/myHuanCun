@@ -201,6 +201,9 @@ class MSHRAlloc(implicit p: Parameters) extends HuanCunModule {
       (s.bits.set(block_granularity - 1, 0) === io.a_req.bits.set(block_granularity - 1, 0))
   ))
 
+  // XSPerfHistogram(cacheParams, "nrWorkingmshr", 
+      // PopCount(io.status.init.init.map(_.valid)) + io.status.take(mshrs+1).last.valid.asUInt
+      // + io.status.last.valid.asUInt, true.B, 0, mshrsAll, 1)
   XSPerfAccumulate(cacheParams, "nrWorkingABCmshr", PopCount(io.status.init.init.map(_.valid)))
   XSPerfAccumulate(cacheParams, "nrWorkingBmshr", io.status.take(mshrs+1).last.valid)
   XSPerfAccumulate(cacheParams, "nrWorkingCmshr", io.status.last.valid)

@@ -10,6 +10,13 @@ import huancun._
 import huancun.utils._
 import huancun.MetaData._
 import utility.ParallelMax
+import utility.ChiselDB
+import utility.Table
+
+class Demand_Trace extends Bundle {
+  val paddr = UInt(36.W)
+  val hit = Bool()
+}
 
 class C_Status(implicit p: Parameters) extends HuanCunBundle {
   // When C nest A, A needs to know the status of C and tells C to release through to next level
@@ -1509,4 +1516,19 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
     req.fromA && (preferCache_latch || self_meta.hit) && !acquirePermMiss
 
   val read_miss = !self_meta.hit || self_meta.state === INVALID
+
+  val dd_trace = Wire(new Demand_Trace)
+  dd_trace.paddr := Cat(req.tag, req.set, 0.U(offsetBits.W))
+  dd_trace.hit := self_meta.hit
+  
+  if (prefetchOpt.nonEmpty) {
+    if (ChiselDB.getTable("DemandTrace") == None) {
+      val table = ChiselDB.createTable("DemandTrace", new Demand_Trace)
+      table.log(dd_trace, req_valid && req_acquire && req.fromA, "L2", clock, reset)
+    }
+    else {
+      val table = ChiselDB.getTable("DemandTrace").get.asInstanceOf[Table[Demand_Trace]]
+      table.log(dd_trace, req_valid && req_acquire && req.fromA, "L2", clock, reset)
+    }
+  }
 }

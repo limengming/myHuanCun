@@ -9,7 +9,7 @@ import utility._
 
 class Trace extends Bundle {
   val paddr = UInt(36.W)
-  val pc = UInt(39.W)
+  val carried = UInt(39.W)
 }
 
 class PrefetchReq(implicit p: Parameters) extends PrefetchBundle {
@@ -80,6 +80,9 @@ class PrefetchQueue(implicit p: Parameters) extends PrefetchModule {
   io.enq.ready := true.B
   io.deq.valid := !empty || io.enq.valid
   io.deq.bits := Mux(empty, io.enq.bits, queue(head))
+
+  //XSPerfHistogram(cacheParams, "nrWorkingPfQueueEntries", 
+  //  PopCount(valids), true.B, 0, inflightEntries, 1)
 }
 
 class Prefetcher(implicit p: Parameters) extends PrefetchModule {
