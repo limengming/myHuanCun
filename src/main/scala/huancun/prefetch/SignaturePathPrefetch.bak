@@ -2,7 +2,6 @@
 package huancun.prefetch
 
 import huancun.utils.SRAMTemplate
-import huancun.utils.ReplaceableQueue
 import chipsalliance.rocketchip.config.Parameters
 import chisel3._
 import chisel3.util._
@@ -14,10 +13,9 @@ case class SPPParameters(
   sTableEntries: Int = 1024,
   pTableEntries: Int = 4096,
   pTableDeltaEntries: Int = 4,
-  pTableQueueEntries: Int = 5,
   signatureBits: Int = 12,
   maxPrefetchCount: Int = 15,
-  fTableEntries: Int = 32,
+  fTableEntries: Int = 128,
   fTableQueueEntries: Int = 15
 )
     extends PrefetchParameters {
@@ -33,7 +31,6 @@ trait HasSPPParams extends HasHuanCunParameters {
   val inflightEntries = sppParams.inflightEntries
   val pTableDeltaEntries = sppParams.pTableDeltaEntries
   val signatureBits = sppParams.signatureBits
-  val pTableQueueEntries = sppParams.pTableQueueEntries
   val maxPrefetchCount = sppParams.maxPrefetchCount
   val fTableEntries = sppParams.fTableEntries
   val fTableQueueEntries = sppParams.fTableQueueEntries
@@ -159,10 +156,6 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
     new SRAMTemplate(pTableEntry(), set = pTableEntries, way = 1, bypassWrite = true)
   )
 
-  val q = Module(new ReplaceableQueue(chiselTypeOf(io.req.bits), pTableQueueEntries))
-  q.io.enq <> io.req
-  val req = q.io.deq.bits
-
   val s_idle :: s_lookahead0 :: s_lookahead :: Nil = Enum(3)
   val state = RegInit(s_idle)
   val readResult = Wire(pTableEntry())
@@ -173,7 +166,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   val hit = WireDefault(false.B)
   val enread = WireDefault(false.B)
   val enprefetch = WireDefault(false.B)
-  val enwrite = RegNext(q.io.deq.fire() && pTable.io.r.req.fire()) //we only modify-write on demand requests
+  val enwrite = RegNext(io.req.fire() && pTable.io.r.req.fire()) //we only modify-write on demand requests
   val current = Reg(new SignatureTableResp) // RegInit(0.U.asTypeOf(new PatternTableResp))
 
   //read pTable
@@ -239,21 +232,35 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   //FSM
   switch(state) {
     is(s_idle) {
-      when(q.io.deq.fire()) {
-        readSignature := req.signature
-        readDelta := req.delta
+      when(io.req.fire()) {
+        readSignature := io.req.bits.signature
+        readDelta := io.req.bits.delta
         state := s_lookahead0
-        current := req
+        current := io.req.bits
         enread := true.B
       }
     }
     is(s_lookahead0) {
       enread := true.B
-      readSignature := (lastSignature << 3) ^ lastDelta.asUInt
-      state := s_lookahead
+      when(io.req.fire()) {
+        readSignature := io.req.bits.signature
+        readDelta := io.req.bits.delta
+        current := io.req.bits
+      } .otherwise {
+        readSignature := (lastSignature << 3) ^ lastDelta.asUInt
+        state := s_lookahead
+      }
     }
     is(s_lookahead) {
-      when(hit) {
+      when(io.req.fire()) {
+        readSignature := io.req.bits.signature
+        readDelta := io.req.bits.delta
+        state := s_lookahead0
+        current := io.req.bits
+        issueCount := 0.U
+        enread := true.B
+      }
+      when(!io.req.fire() && hit) {
         val issued = delta_list.map(a => Mux(a =/= 0.S, 1.U, 0.U)).reduce(_ +& _)
         when(issued =/= 0.U) {
           enprefetch := true.B
@@ -274,14 +281,15 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
           issueCount := 0.U
           state := s_idle
         } 
-      } .otherwise {
-        issueCount := 0.U
-        state := s_idle
+      }
+      when(!io.req.fire() && !hit) {
+         issueCount := 0.U
+         state := s_idle
       }
     }
   }
 
-  q.io.deq.ready := state === s_idle
+  io.req.ready := !pTable.io.w.req.fire()
 }
 
 //Can add eviction notify or cycle counter for each entry

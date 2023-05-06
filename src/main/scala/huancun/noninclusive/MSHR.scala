@@ -827,7 +827,7 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
       s_wbselfdir := false.B
     }
     prefetchOpt.map(_ => {
-      when(req.opcode =/= Hint && req.needHint.getOrElse(false.B) && (!self_meta.hit || self_meta.prefetch.get)) {
+      when(req.opcode =/= Hint && req.needHint.getOrElse(false.B)) {
         s_triggerprefetch.map(_ := false.B)
       }
       when(req.opcode === Hint && req.isBop.getOrElse(false.B)) {
