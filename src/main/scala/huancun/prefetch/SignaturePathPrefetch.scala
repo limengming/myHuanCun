@@ -17,7 +17,8 @@ case class SPPParameters(
   pTableQueueEntries: Int = 5,
   signatureBits: Int = 12,
   maxPrefetchCount: Int = 15,
-  fTableEntries: Int = 32,
+  maxPrefetchDegree: Int = 15,
+  fTableEntries: Int = 1024,
   fTableQueueEntries: Int = 15
 )
     extends PrefetchParameters {
@@ -35,6 +36,7 @@ trait HasSPPParams extends HasHuanCunParameters {
   val signatureBits = sppParams.signatureBits
   val pTableQueueEntries = sppParams.pTableQueueEntries
   val maxPrefetchCount = sppParams.maxPrefetchCount
+  val maxPrefetchDegree = sppParams.maxPrefetchDegree
   val fTableEntries = sppParams.fTableEntries
   val fTableQueueEntries = sppParams.fTableQueueEntries
 
@@ -236,6 +238,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   pTable.io.w.req.bits.data(0).count := count
   
   val issueCount = RegInit(0.U(5.W))
+  val lookCount = RegInit(0.U(4.W))
   //FSM
   switch(state) {
     is(s_idle) {
@@ -261,20 +264,25 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
           //same page?
           when(testOffset(pageAddrBits + blkOffsetBits - 1, blkOffsetBits) === 
             current.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)
-            && issueCount < maxPrefetchCount.asUInt) {
+            && issueCount < maxPrefetchCount.asUInt
+            && lookCount < maxPrefetchDegree.asUInt) {
             issueCount := issueCount + issued
+            lookCount := lookCount + 1.U
             readSignature := (lastSignature << 3) ^ maxEntry.delta.asUInt
             current.block := testOffset
             enread := true.B
           } .otherwise {
+            lookCount := 0.U
             issueCount := 0.U
             state := s_idle
           }
         }.otherwise {
+          lookCount := 0.U
           issueCount := 0.U
           state := s_idle
         } 
       } .otherwise {
+        lookCount := 0.U
         issueCount := 0.U
         state := s_idle
       }
@@ -288,6 +296,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
 class FilterTable(implicit p: Parameters) extends SPPModule {
   val io = IO(new Bundle {
     val req = Flipped(DecoupledIO(new PatternTableResp))
+    val evict = Flipped(DecoupledIO(new PrefetchEvict))
     val resp = DecoupledIO(new FilterTableResp)
   })
 
@@ -305,7 +314,7 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
 
   val q = Module(new Queue(chiselTypeOf(io.req.bits), fTableQueueEntries))
   q.io.enq <> io.req //change logic to replace the tail entry
-  q.io.deq.ready := !inProcess
+  q.io.deq.ready := !inProcess && !io.evict.valid
   val req = RegEnable(q.io.deq.bits, q.io.deq.fire())
   val req_deltas = Reg(Vec(pTableDeltaEntries, SInt((blkOffsetBits + 1).W)))
   when(q.io.deq.fire()) {
@@ -319,35 +328,50 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
   val extract_delta = req_deltas.reduce((a, b) => Mux(a =/= 0.S, a, b))
   val prefetchBlock = (req.block.asSInt + extract_delta).asUInt
 
+  io.evict.ready := !inProcess
+  val evictBlock = io.evict.bits.addr >> offsetBits
+  val evict = Reg(Bool())
+  val selectedBlock = Mux(io.evict.fire, evictBlock, prefetchBlock)
+
   fTable.io.r.req.valid := enread
-  fTable.io.r.req.bits.setIdx := idx(prefetchBlock)
+  fTable.io.r.req.bits.setIdx := idx(selectedBlock)
   rData := fTable.io.r.resp.data(0)
-  hit := rData.valid && rData.tag === RegNext(tag(prefetchBlock))
+  hit := rData.valid && rData.tag === RegNext(tag(selectedBlock))
 
-  fTable.io.w.req.valid := !hit && RegNext(fTable.io.r.req.fire())
-  fTable.io.w.req.bits.setIdx := idx(RegNext(prefetchBlock))
-  fTable.io.w.req.bits.data(0).valid := true.B
-  fTable.io.w.req.bits.data(0).tag := tag(RegNext(prefetchBlock))
+  fTable.io.w.req.valid := ((hit && evict) || (!hit && !evict)) && RegNext(fTable.io.r.req.fire())
+  fTable.io.w.req.bits.setIdx := idx(RegNext(selectedBlock))
+  fTable.io.w.req.bits.data(0).valid := Mux(evict, false.B, true.B)
+  fTable.io.w.req.bits.data(0).tag := tag(RegNext(selectedBlock))
 
-  io.resp.valid := !hit && RegNext(fTable.io.r.req.fire())
+  io.resp.valid := !hit && !evict && RegNext(fTable.io.r.req.fire())
   io.resp.bits.prefetchBlock := RegNext(prefetchBlock)
   io.resp.bits.source := RegNext(req.source)
   io.resp.bits.needT := RegNext(req.needT)
 
   when(inProcess) {
-    when(!issue_finish) {
-      val testOffset = (req.block.asSInt + extract_delta).asUInt
-      when(testOffset(pageAddrBits + blkOffsetBits - 1, blkOffsetBits) === 
-            req.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)) {
-        enread := true.B
+    when(!evict) {
+      when(!issue_finish) {
+        val testOffset = (req.block.asSInt + extract_delta).asUInt
+        when(testOffset(pageAddrBits + blkOffsetBits - 1, blkOffsetBits) === 
+              req.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)) {
+          enread := true.B
+        }
+        req_deltas := req_deltas.map(a => Mux(a === extract_delta, 0.S, a))
+      } .otherwise {
+        inProcess := false.B
       }
-      req_deltas := req_deltas.map(a => Mux(a === extract_delta, 0.S, a))
     } .otherwise {
       inProcess := false.B
     }
   } .otherwise {
     when(q.io.deq.fire()) {
       inProcess := true.B
+      evict := false.B
+    }
+    when(io.evict.fire()) {
+      inProcess := true.B
+      evict := true.B
+      enread := true.B
     }
   }
 }
@@ -357,6 +381,7 @@ class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
     val train = Flipped(DecoupledIO(new PrefetchTrain)) //from higher level cache
     val req = DecoupledIO(new PrefetchReq) //issue to next-level cache
     val resp = Flipped(DecoupledIO(new PrefetchResp)) //fill request from the next-level cache, using this to update filter
+    val evict = Flipped(DecoupledIO(new PrefetchEvict))
   })
 
   val sTable = Module(new SignatureTable)
@@ -378,6 +403,7 @@ class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
 
   pTable.io.req <> sTable.io.resp //to detail
   pTable.io.resp <> fTable.io.req
+  fTable.io.evict <> io.evict
 
   val req = Reg(new PrefetchReq)
   val req_valid = RegInit(false.B)

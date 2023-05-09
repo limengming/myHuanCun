@@ -547,6 +547,7 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
   val s_writeprobe = RegInit(true.B)
   val s_triggerprefetch = prefetchOpt.map(_ => RegInit(true.B))
   val s_prefetchack = prefetchOpt.map(_ => RegInit(true.B))
+  val s_prefetchevict = prefetchOpt.map(_ => RegInit(true.B))
 
   val w_probeackfirst = RegInit(true.B) // first beat of the last probeack
   val w_probeacklast = RegInit(true.B) // last beat of the last probeack
@@ -577,6 +578,7 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
     s_writeprobe := true.B
     s_triggerprefetch.foreach(_ := true.B)
     s_prefetchack.foreach(_ := true.B)
+    s_prefetchevict.foreach(_ := true.B)
 
     w_probeackfirst := true.B
     w_probeacklast := true.B
@@ -813,6 +815,9 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
       !self_meta.hit && preferCache &&
         (req.opcode === Get || req.opcode === AcquireBlock || prefetch_need_data)
     ) {
+      when(self_meta.state =/= INVALID) {
+        s_prefetchevict.map(_ := false.B)
+      }
       s_wbselftag := false.B
     }
     // need to transfer exactly the request to sourceA when Put miss
@@ -946,6 +951,7 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
     )
   }
 
+  // condition to issue request to other agents
   val can_start = Mux(client_dir_conflict, probe_helper_finish, true.B)
   io.tasks.source_a.valid := io.enable && (!s_acquire || !s_transferput) && s_release && s_probe && w_probeacklast && can_start
   io.tasks.source_b.valid := io.enable && !s_probe && s_release
@@ -961,6 +967,7 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
   io.tasks.sink_c.valid := io.enable && ((!s_writerelease && (!releaseSave || s_release)) || (!s_writeprobe))
   io.tasks.prefetch_train.foreach(_.valid := !s_triggerprefetch.get)
   io.tasks.prefetch_resp.foreach(_.valid := !s_prefetchack.get && w_grantfirst)
+  io.tasks.prefetch_evict.foreach(_.valid := !s_prefetchevict.get)
 
   val oa = io.tasks.source_a.bits
   val ob = io.tasks.source_b.bits
@@ -1247,6 +1254,11 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
     resp.bits.set := req.set
   }
 
+  io.tasks.prefetch_evict.foreach { evict =>
+    evict.bits.tag := meta_reg.self.tag
+    evict.bits.set := req.set
+  }
+
   dontTouch(io.tasks)
   when(io.tasks.source_a.fire()) {
     s_acquire := true.B
@@ -1291,6 +1303,9 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
     }
     when(io.tasks.prefetch_resp.get.fire()) {
       s_prefetchack.get := true.B
+    }
+    when(io.tasks.prefetch_evict.get.fire()) {
+      s_prefetchevict.get := true.B
     }
   }
 
@@ -1404,6 +1419,7 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
     s_writerelease && s_writeprobe &&
     s_triggerprefetch.getOrElse(true.B) &&
     s_prefetchack.getOrElse(true.B) &&
+    s_prefetchevict.getOrElse(true.B) &&
     s_transferput
   will_be_free := no_wait && no_schedule
   when(will_be_free) {

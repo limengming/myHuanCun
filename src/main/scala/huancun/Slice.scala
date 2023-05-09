@@ -515,9 +515,15 @@ class Slice()(implicit p: Parameters) extends HuanCunModule {
       abc_mshr.map(_.io.tasks.prefetch_resp.get),
       Some("prefetchResp")
     )
+    arbTasks(
+      pft.evict,
+      abc_mshr.map(_.io.tasks.prefetch_evict.get),
+      Some("prefetchEvict")
+    )
     for (mshr <- Seq(bc_mshr, c_mshr)) {
       mshr.io.tasks.prefetch_train.foreach(_.ready := true.B)
       mshr.io.tasks.prefetch_resp.foreach(_.ready := true.B)
+      mshr.io.tasks.prefetch_evict.foreach(_.ready := true.B)
     }
   }
 

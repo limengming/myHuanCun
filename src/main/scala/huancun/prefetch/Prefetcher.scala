@@ -39,10 +39,18 @@ class PrefetchTrain(implicit p: Parameters) extends PrefetchBundle {
   def addr = Cat(tag, set, 0.U(offsetBits.W))
 }
 
+class PrefetchEvict(implicit p: Parameters) extends PrefetchBundle {
+  // val id = UInt(sourceIdBits.W)
+  val tag = UInt(fullTagBits.W)
+  val set = UInt(setBits.W)
+  def addr = Cat(tag, set, 0.U(offsetBits.W))
+}
+
 class PrefetchIO(implicit p: Parameters) extends PrefetchBundle {
   val train = Flipped(DecoupledIO(new PrefetchTrain))
   val req = DecoupledIO(new PrefetchReq)
   val resp = Flipped(DecoupledIO(new PrefetchResp))
+  val evict = Flipped(DecoupledIO(new PrefetchEvict))
   val recv_addr = Flipped(ValidIO(UInt(64.W)))
 }
 
@@ -105,6 +113,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
       val pipe = Module(new Pipeline(io.req.bits.cloneType, 1))
       pft.io.train <> io.train
       pft.io.resp <> io.resp
+      pft.io.evict <> io.evict
       pftQueue.io.enq <> pft.io.req
       pipe.io.in <> pftQueue.io.deq
       io.req <> pipe.io.out
