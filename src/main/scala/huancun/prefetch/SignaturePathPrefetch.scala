@@ -16,9 +16,7 @@ case class SPPParameters(
   pTableDeltaEntries: Int = 4,
   pTableQueueEntries: Int = 5,
   signatureBits: Int = 12,
-  maxPrefetchCount: Int = 10,
-  maxPrefetchDegree: Int = 5,
-  fTableEntries: Int = 1024,
+  fTableEntries: Int = 128,
   fTableQueueEntries: Int = 5
 )
     extends PrefetchParameters {
@@ -35,8 +33,6 @@ trait HasSPPParams extends HasHuanCunParameters {
   val pTableDeltaEntries = sppParams.pTableDeltaEntries
   val signatureBits = sppParams.signatureBits
   val pTableQueueEntries = sppParams.pTableQueueEntries
-  val maxPrefetchCount = sppParams.maxPrefetchCount
-  val maxPrefetchDegree = sppParams.maxPrefetchDegree
   val fTableEntries = sppParams.fTableEntries
   val fTableQueueEntries = sppParams.fTableQueueEntries
 
@@ -158,7 +154,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   }
 
   val pTable = Module(
-    new SRAMTemplate(pTableEntry(), set = pTableEntries, way = 1, bypassWrite = true)
+    new SRAMTemplate(pTableEntry(), set = pTableEntries, way = 1, bypassWrite = true, shouldReset = true)
   )
 
   val q = Module(new ReplaceableQueue(chiselTypeOf(io.req.bits), pTableQueueEntries))
@@ -177,6 +173,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   val enprefetch = WireDefault(false.B)
   val enwrite = RegNext(q.io.deq.fire() && pTable.io.r.req.fire()) //we only modify-write on demand requests
   val current = Reg(new SignatureTableResp) // RegInit(0.U.asTypeOf(new PatternTableResp))
+  val lookCount = RegInit(0.U(5.W))
 
   //read pTable
   pTable.io.r.req.valid := enread
@@ -187,11 +184,13 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   lastDelta := RegNext(readDelta)
   //set output
   val maxEntry = readResult.deltaEntries.reduce((a, b) => Mux(a.cDelta >= b.cDelta, a, b))
-  val delta_list = readResult.deltaEntries.map(x => Mux((x.cDelta << 1.U) >= readResult.count, 
-                                              x.delta, 0.S))
-  
+  val delta_list = readResult.deltaEntries.map(x => Mux(x.cDelta > lookCount, x.delta, 0.S))
+  val delta_list_checked = delta_list.map(x => 
+            Mux((current.block.asSInt + x).asUInt(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)
+            === current.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits), x, 0.S))
+
   io.resp.bits.block := current.block
-  io.resp.bits.deltas := delta_list
+  io.resp.bits.deltas := delta_list_checked
   io.resp.bits.needT := current.needT
   io.resp.bits.source := current.source
   io.resp.valid := enprefetch
@@ -237,8 +236,6 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   pTable.io.w.req.bits.data(0).deltaEntries := deltaEntries
   pTable.io.w.req.bits.data(0).count := count
   
-  val issueCount = RegInit(0.U(5.W))
-  val lookCount = RegInit(0.U(4.W))
   //FSM
   switch(state) {
     is(s_idle) {
@@ -257,33 +254,28 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
     }
     is(s_lookahead) {
       when(hit) {
-        val issued = delta_list.map(a => Mux(a =/= 0.S, 1.U, 0.U)).reduce(_ +& _)
+        val issued = delta_list_checked.map(a => Mux(a =/= 0.S, 1.U, 0.U)).reduce(_ +& _)
         when(issued =/= 0.U) {
           enprefetch := true.B
           val testOffset = (current.block.asSInt + maxEntry.delta).asUInt
           //same page?
           when(testOffset(pageAddrBits + blkOffsetBits - 1, blkOffsetBits) === 
             current.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)
-            && issueCount < maxPrefetchCount.asUInt
-            && lookCount < maxPrefetchDegree.asUInt) {
-            issueCount := issueCount + issued
+            && maxEntry.cDelta > lookCount) {
             lookCount := lookCount + 1.U
             readSignature := (lastSignature << 3) ^ maxEntry.delta.asUInt
             current.block := testOffset
             enread := true.B
           } .otherwise {
             lookCount := 0.U
-            issueCount := 0.U
             state := s_idle
           }
         }.otherwise {
           lookCount := 0.U
-          issueCount := 0.U
           state := s_idle
         } 
       } .otherwise {
         lookCount := 0.U
-        issueCount := 0.U
         state := s_idle
       }
     }
@@ -309,18 +301,20 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
 
   val inProcess = RegInit(false.B)
   val fTable = Module(
-    new SRAMTemplate(fTableEntry(), set = fTableEntries, way = 1, bypassWrite = true)
+    new SRAMTemplate(fTableEntry(), set = fTableEntries, way = 1, bypassWrite = true, shouldReset = true)
   )
 
   val q = Module(new ReplaceableQueue(chiselTypeOf(io.req.bits), fTableQueueEntries))
   q.io.enq <> io.req //change logic to replace the tail entry
-  q.io.deq.ready := !inProcess && !io.evict.valid
+
   val req = RegEnable(q.io.deq.bits, q.io.deq.fire())
   val req_deltas = Reg(Vec(pTableDeltaEntries, SInt((blkOffsetBits + 1).W)))
+  val issue_finish = req_deltas.map(_ === 0.S).reduce(_ && _)
+  q.io.deq.ready := !inProcess || issue_finish
   when(q.io.deq.fire()) {
     req_deltas := q.io.deq.bits.deltas
   }
-  val issue_finish = req_deltas.map(_ === 0.S).reduce(_ && _)
+  
 
   val rData = Wire(fTableEntry())
   val hit = WireDefault(false.B)
@@ -328,54 +322,37 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
   val extract_delta = req_deltas.reduce((a, b) => Mux(a =/= 0.S, a, b))
   val prefetchBlock = (req.block.asSInt + extract_delta).asUInt
 
-  io.evict.ready := !inProcess
-  val evictBlock = io.evict.bits.addr >> offsetBits
-  val evict = Reg(Bool())
-  val selectedBlock = Mux(io.evict.fire, evictBlock, prefetchBlock)
-
   fTable.io.r.req.valid := enread
-  fTable.io.r.req.bits.setIdx := idx(selectedBlock)
+  fTable.io.r.req.bits.setIdx := idx(prefetchBlock)
   rData := fTable.io.r.resp.data(0)
-  hit := rData.valid && rData.tag === RegNext(tag(selectedBlock))
+  hit := rData.valid && rData.tag === RegNext(tag(prefetchBlock))
 
-  fTable.io.w.req.valid := ((hit && evict) || (!hit && !evict)) && RegNext(fTable.io.r.req.fire())
-  fTable.io.w.req.bits.setIdx := idx(RegNext(selectedBlock))
-  fTable.io.w.req.bits.data(0).valid := Mux(evict, false.B, true.B)
-  fTable.io.w.req.bits.data(0).tag := tag(RegNext(selectedBlock))
+  fTable.io.w.req.valid := !hit && RegNext(fTable.io.r.req.fire())
+  fTable.io.w.req.bits.setIdx := idx(RegNext(prefetchBlock))
+  fTable.io.w.req.bits.data(0).valid := true.B
+  fTable.io.w.req.bits.data(0).tag := tag(RegNext(prefetchBlock))
 
-  io.resp.valid := !hit && !evict && RegNext(fTable.io.r.req.fire())
+  io.resp.valid := !hit && RegNext(fTable.io.r.req.fire())
   io.resp.bits.prefetchBlock := RegNext(prefetchBlock)
   io.resp.bits.source := RegNext(req.source)
   io.resp.bits.needT := RegNext(req.needT)
 
   when(inProcess) {
-    when(!evict) {
-      when(!issue_finish) {
-        val testOffset = (req.block.asSInt + extract_delta).asUInt
-        when(testOffset(pageAddrBits + blkOffsetBits - 1, blkOffsetBits) === 
-              req.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)) {
-          enread := true.B
-        }
-        req_deltas := req_deltas.map(a => Mux(a === extract_delta, 0.S, a))
-      } .otherwise {
+    when(!issue_finish) {
+      enread := true.B
+      req_deltas := req_deltas.map(a => Mux(a === extract_delta, 0.S, a))
+    } .otherwise {
+      when(!q.io.deq.fire()) {
         inProcess := false.B
       }
-    } .otherwise {
-      inProcess := false.B
     }
   } .otherwise {
     when(q.io.deq.fire()) {
       inProcess := true.B
-      evict := false.B
-    }
-    when(io.evict.fire()) {
-      inProcess := true.B
-      evict := true.B
-      enread := true.B
     }
   }
-  
-  XSPerfAccumulate(cacheParams, "evict_hit_ft", hit && evict && RegNext(fTable.io.r.req.fire()))
+
+  io.evict.ready := true.B
 }
 
 class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
