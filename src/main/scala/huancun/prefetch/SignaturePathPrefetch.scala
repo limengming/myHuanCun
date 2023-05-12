@@ -14,9 +14,9 @@ case class SPPParameters(
   sTableEntries: Int = 1024,
   pTableEntries: Int = 4096,
   pTableDeltaEntries: Int = 4,
-  pTableQueueEntries: Int = 5,
+  pTableQueueEntries: Int = 8,
   signatureBits: Int = 12,
-  fTableEntries: Int = 128,
+  fTableEntries: Int = 16,
   fTableQueueEntries: Int = 5
 )
     extends PrefetchParameters {
@@ -148,7 +148,6 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
 
   def pTableEntry() = new Bundle {
     val valid = Bool()
-    //val deltaEntries = VecInit(Seq.fill(pTableDeltaEntries)((new DeltaEntry).apply(0.S, 0.U)))
     val deltaEntries = Vec(pTableDeltaEntries, new DeltaEntry())
     val count = UInt(4.W)
   }
@@ -157,34 +156,56 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
     new SRAMTemplate(pTableEntry(), set = pTableEntries, way = 1, bypassWrite = true, shouldReset = true)
   )
 
-  val q = Module(new ReplaceableQueue(chiselTypeOf(io.req.bits), pTableQueueEntries))
-  q.io.enq <> io.req
-  val req = q.io.deq.bits
-
-  val s_idle :: s_lookahead0 :: s_lookahead :: Nil = Enum(3)
-  val state = RegInit(s_idle)
-  val readResult = Wire(pTableEntry())
-  val readSignature = WireDefault(0.U(signatureBits.W)) //to differentiate the result from io or lookahead, set based on state
-  val readDelta = WireDefault(0.S((blkOffsetBits + 1).W))
-  val lastSignature = Wire(UInt(signatureBits.W))
-  val lastDelta = Wire(SInt((blkOffsetBits + 1).W))
-  val hit = WireDefault(false.B)
   val enread = WireDefault(false.B)
+  val req = Reg(new SignatureTableResp)
+  val req_valid = RegInit(false.B)
+  val readSignature = WireInit(0.U(signatureBits.W))
+  val updatedSignature = (req.signature << 3) ^ req.delta.asUInt
+  when(io.req.fire()) {
+    req := io.req.bits
+    req_valid := true.B
+    enread := true.B
+    readSignature := io.req.bits.signature
+  }
+  io.req.ready := !req_valid
+
+  def queueEntry() = new Bundle {
+    val block = UInt((pageAddrBits + blkOffsetBits).W)
+    val signature = UInt(signatureBits.W)
+    val needT = Bool()
+    val source = UInt(sourceIdBits.W)
+    val prefetchMinCount = UInt(5.W)
+  }
+  val recursionQueue = Module(new ReplaceableQueue(queueEntry, pTableQueueEntries))
+  val queue_req = RegEnable(recursionQueue.io.deq.bits, recursionQueue.io.deq.fire())
+  val queue_req_valid = RegInit(false.B)
+  val newEntry = WireInit(0.U.asTypeOf(queueEntry))
+  when(recursionQueue.io.deq.fire()) {
+    queue_req_valid := true.B
+  }
+  recursionQueue.io.deq.ready := !queue_req_valid
+  recursionQueue.io.enq.bits := newEntry
+  recursionQueue.io.enq.valid := false.B
+
+  val readDelta = WireDefault(0.S((blkOffsetBits + 1).W))
+  val lastDelta = RegNext(readDelta)
+  val lastSignature = RegNext(readSignature)
+  val readResult = Wire(pTableEntry())
+  val hit = WireDefault(false.B)
+
+  val lookState = WireDefault(false.B)
+  val lastLookState = RegNext(lookState)
   val enprefetch = WireDefault(false.B)
-  val enwrite = RegNext(q.io.deq.fire() && pTable.io.r.req.fire()) //we only modify-write on demand requests
-  val current = Reg(new SignatureTableResp) // RegInit(0.U.asTypeOf(new PatternTableResp))
-  val lookCount = RegInit(0.U(5.W))
+  val current = Reg(queueEntry) // RegInit(0.U.asTypeOf(new PatternTableResp))
 
   //read pTable
-  pTable.io.r.req.valid := enread
+  pTable.io.r.req.valid := enread || lookState
   pTable.io.r.req.bits.setIdx := readSignature
   readResult := pTable.io.r.resp.data(0)
   hit := readResult.valid
-  lastSignature := RegNext(readSignature)
-  lastDelta := RegNext(readDelta)
   //set output
   val maxEntry = readResult.deltaEntries.reduce((a, b) => Mux(a.cDelta >= b.cDelta, a, b))
-  val delta_list = readResult.deltaEntries.map(x => Mux(x.cDelta > lookCount, x.delta, 0.S))
+  val delta_list = readResult.deltaEntries.map(x => Mux(x.cDelta > current.prefetchMinCount, x.delta, 0.S))
   val delta_list_checked = delta_list.map(x => 
             Mux((current.block.asSInt + x).asUInt(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)
             === current.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits), x, 0.S))
@@ -230,58 +251,55 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
     count := 1.U
   }
   //write pTable
-  pTable.io.w.req.valid := enwrite
+  pTable.io.w.req.valid := io.req.fire() && pTable.io.r.req.fire()
   pTable.io.w.req.bits.setIdx := lastSignature
   pTable.io.w.req.bits.data(0).valid := true.B
   pTable.io.w.req.bits.data(0).deltaEntries := deltaEntries
   pTable.io.w.req.bits.data(0).count := count
-  
-  //FSM
-  switch(state) {
-    is(s_idle) {
-      when(q.io.deq.fire()) {
-        readSignature := req.signature
-        readDelta := req.delta
-        state := s_lookahead0
-        current := req
-        enread := true.B
-      }
-    }
-    is(s_lookahead0) {
-      enread := true.B
-      readSignature := (lastSignature << 3) ^ lastDelta.asUInt
-      state := s_lookahead
-    }
-    is(s_lookahead) {
-      when(hit) {
-        val issued = delta_list_checked.map(a => Mux(a =/= 0.S, 1.U, 0.U)).reduce(_ +& _)
-        when(issued =/= 0.U) {
-          enprefetch := true.B
-          val testOffset = (current.block.asSInt + maxEntry.delta).asUInt
-          //same page?
-          when(testOffset(pageAddrBits + blkOffsetBits - 1, blkOffsetBits) === 
-            current.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)
-            && maxEntry.cDelta > lookCount) {
-            lookCount := lookCount + 1.U
-            readSignature := (lastSignature << 3) ^ maxEntry.delta.asUInt
-            current.block := testOffset
-            enread := true.B
-          } .otherwise {
-            lookCount := 0.U
-            state := s_idle
-          }
-        }.otherwise {
-          lookCount := 0.U
-          state := s_idle
-        } 
-      } .otherwise {
-        lookCount := 0.U
-        state := s_idle
-      }
+
+  // lookahead read table
+  when(!io.req.fire()) {
+    when(req_valid) {
+      readSignature := updatedSignature
+      readDelta := req.delta
+      req_valid := false.B
+      current.signature := updatedSignature
+      current.block := req.block
+      current.needT := req.needT
+      current.source := req.source
+      current.prefetchMinCount := 0.U
+      lookState := true.B
+    } .elsewhen(queue_req_valid) {
+      readSignature := queue_req.signature
+      queue_req_valid := false.B
+      current.signature := queue_req.signature
+      current.block := queue_req.block
+      current.needT := queue_req.needT
+      current.source := queue_req.source
+      current.prefetchMinCount := queue_req.prefetchMinCount
+      lookState := true.B
     }
   }
 
-  q.io.deq.ready := state === s_idle
+  when(lastLookState && hit) {
+    val issued = delta_list_checked.map(a => Mux(a =/= 0.S, 1.U, 0.U)).reduce(_ +& _)
+    when(issued =/= 0.U) {
+      enprefetch := true.B
+      val testOffset = (current.block.asSInt + maxEntry.delta).asUInt
+      //same page?
+      when(testOffset(pageAddrBits + blkOffsetBits - 1, blkOffsetBits) === 
+        current.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)
+        && maxEntry.cDelta > current.prefetchMinCount) {
+        newEntry.block := testOffset
+        newEntry.signature := (lastSignature << 3) ^ maxEntry.delta.asUInt
+        newEntry.needT := current.needT
+        newEntry.source := current.source
+        newEntry.prefetchMinCount := current.prefetchMinCount + 1.U
+        recursionQueue.io.enq.valid := true.B
+        recursionQueue.io.enq.bits := newEntry
+      }
+    }
+  }
 }
 
 //Can add eviction notify or cycle counter for each entry
