@@ -3,6 +3,7 @@ package huancun.prefetch
 
 import huancun.utils.SRAMTemplate
 import huancun.utils.ReplaceableQueue
+import huancun.utils.ReplaceableQueueV2
 import chipsalliance.rocketchip.config.Parameters
 import chisel3._
 import chisel3.util._
@@ -160,7 +161,8 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   val req = Reg(new SignatureTableResp)
   val req_valid = RegInit(false.B)
   val readSignature = WireInit(0.U(signatureBits.W))
-  val updatedSignature = (req.signature << 3) ^ req.delta.asUInt
+  val updatedSignature = Wire(UInt(signatureBits.W))
+  updatedSignature := (req.signature << 3) ^ req.delta.asUInt
   when(io.req.fire()) {
     req := io.req.bits
     req_valid := true.B
@@ -176,19 +178,14 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
     val source = UInt(sourceIdBits.W)
     val prefetchMinCount = UInt(5.W)
   }
-  val recursionQueue = Module(new ReplaceableQueue(queueEntry, pTableQueueEntries))
-  val queue_req = RegEnable(recursionQueue.io.deq.bits, recursionQueue.io.deq.fire())
-  val queue_req_valid = RegInit(false.B)
+  val recursionQueue = Module(new ReplaceableQueueV2(queueEntry, pTableQueueEntries))
+  val queue_req = recursionQueue.io.deq.bits
   val newEntry = WireInit(0.U.asTypeOf(queueEntry))
-  when(recursionQueue.io.deq.fire()) {
-    queue_req_valid := true.B
-  }
-  recursionQueue.io.deq.ready := !queue_req_valid
   recursionQueue.io.enq.bits := newEntry
+  recursionQueue.io.deq.ready := false.B
   recursionQueue.io.enq.valid := false.B
 
-  val readDelta = WireDefault(0.S((blkOffsetBits + 1).W))
-  val lastDelta = RegNext(readDelta)
+  val lastDelta = RegNext(io.req.bits.delta)
   val lastSignature = RegNext(readSignature)
   val readResult = Wire(pTableEntry())
   val hit = WireDefault(false.B)
@@ -251,7 +248,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
     count := 1.U
   }
   //write pTable
-  pTable.io.w.req.valid := io.req.fire() && pTable.io.r.req.fire()
+  pTable.io.w.req.valid := RegNext(io.req.fire() && pTable.io.r.req.fire())
   pTable.io.w.req.bits.setIdx := lastSignature
   pTable.io.w.req.bits.data(0).valid := true.B
   pTable.io.w.req.bits.data(0).deltaEntries := deltaEntries
@@ -261,7 +258,6 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   when(!io.req.fire()) {
     when(req_valid) {
       readSignature := updatedSignature
-      readDelta := req.delta
       req_valid := false.B
       current.signature := updatedSignature
       current.block := req.block
@@ -269,15 +265,17 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
       current.source := req.source
       current.prefetchMinCount := 0.U
       lookState := true.B
-    } .elsewhen(queue_req_valid) {
-      readSignature := queue_req.signature
-      queue_req_valid := false.B
-      current.signature := queue_req.signature
-      current.block := queue_req.block
-      current.needT := queue_req.needT
-      current.source := queue_req.source
-      current.prefetchMinCount := queue_req.prefetchMinCount
-      lookState := true.B
+    } .otherwise {
+      recursionQueue.io.deq.ready := true.B
+      when(recursionQueue.io.deq.fire()) {
+        readSignature := queue_req.signature
+        current.signature := queue_req.signature
+        current.block := queue_req.block
+        current.needT := queue_req.needT
+        current.source := queue_req.source
+        current.prefetchMinCount := queue_req.prefetchMinCount
+        lookState := true.B
+      }
     }
   }
 

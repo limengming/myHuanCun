@@ -402,6 +402,7 @@ object TestTop_L2 extends App with HasRocketChipStageUtils {
       clientCaches = Seq(CacheParameters(sets = 32, ways = 8, blockGranularity = 5, name = "L2", aliasBitsOpt = Some(2))),
       echoField = Seq(DirtyField()),
       sramClkDivBy2 = true,
+      prefetch = Some(huancun.prefetch.SPPParameters()),
     )
   })
   val top = DisableMonitors(p => LazyModule(new TestTop_L2()(p)) )(config)
