@@ -16,6 +16,7 @@ case class SPPParameters(
   pTableEntries: Int = 4096,
   pTableDeltaEntries: Int = 4,
   pTableQueueEntries: Int = 8,
+  strideIssues: Int = 5,
   signatureBits: Int = 12,
   fTableEntries: Int = 16,
   fTableQueueEntries: Int = 5
@@ -32,8 +33,9 @@ trait HasSPPParams extends HasHuanCunParameters {
   val pTableEntries = sppParams.pTableEntries
   val inflightEntries = sppParams.inflightEntries
   val pTableDeltaEntries = sppParams.pTableDeltaEntries
-  val signatureBits = sppParams.signatureBits
   val pTableQueueEntries = sppParams.pTableQueueEntries
+  val strideIssues = sppParams.strideIssues
+  val signatureBits = sppParams.signatureBits
   val fTableEntries = sppParams.fTableEntries
   val fTableQueueEntries = sppParams.fTableQueueEntries
 
@@ -45,6 +47,24 @@ trait HasSPPParams extends HasHuanCunParameters {
 
 abstract class SPPBundle(implicit val p: Parameters) extends Bundle with HasSPPParams
 abstract class SPPModule(implicit val p: Parameters) extends Module with HasSPPParams
+
+class DeltaEntry(implicit p: Parameters) extends SPPBundle {
+  val delta = SInt((blkOffsetBits + 1).W)
+  val cDelta = UInt(4.W)
+
+  def apply(delta: SInt, cDelta: UInt) = {
+    val entry = Wire(this)
+    entry.delta := delta
+    entry.cDelta := cDelta
+    entry
+  }
+  def apply() = {
+    val entry = Wire(this)
+    entry.delta := 0.S
+    entry.cDelta := 0.U
+    entry
+  }
+}
 
 class SignatureTableReq(implicit p: Parameters) extends SPPBundle {
   val pageAddr = UInt(pageAddrBits.W)
@@ -62,7 +82,7 @@ class SignatureTableResp(implicit p: Parameters) extends SPPBundle {
 }
 
 class PatternTableResp(implicit p: Parameters) extends SPPBundle {
-  val deltas = Vec(pTableDeltaEntries, SInt((blkOffsetBits + 1).W))
+  val deltaEntries = Vec(pTableDeltaEntries, new DeltaEntry())
   val block = UInt((pageAddrBits + blkOffsetBits).W)
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
@@ -73,19 +93,6 @@ class FilterTableResp(implicit p: Parameters) extends SPPBundle {
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
 }
-
-class DeltaEntry(implicit p: Parameters) extends SPPBundle {
-  val delta = SInt((blkOffsetBits + 1).W)
-  val cDelta = UInt(4.W)
-
-  def apply(delta: SInt, cDelta: UInt) = {
-    val entry = Wire(this)
-    entry.delta := delta
-    entry.cDelta := cDelta
-    entry
-  }
-}
-
 
 class SignatureTable(implicit p: Parameters) extends SPPModule {
   val io = IO(new Bundle {
@@ -177,6 +184,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
     val needT = Bool()
     val source = UInt(sourceIdBits.W)
     val prefetchMinCount = UInt(5.W)
+    val delta = SInt((blkOffsetBits + 1).W)
   }
   val recursionQueue = Module(new ReplaceableQueueV2(queueEntry, pTableQueueEntries))
   val queue_req = recursionQueue.io.deq.bits
@@ -193,7 +201,8 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   val lookState = WireDefault(false.B)
   val lastLookState = RegNext(lookState)
   val enprefetch = WireDefault(false.B)
-  val current = Reg(queueEntry) // RegInit(0.U.asTypeOf(new PatternTableResp))
+  val current = Reg(queueEntry)
+  val look_delta = Mux(RegNext(req_valid), RegNext(req.delta), RegNext(queue_req.delta))
 
   //read pTable
   pTable.io.r.req.valid := enread || lookState
@@ -202,13 +211,16 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   hit := readResult.valid
   //set output
   val maxEntry = readResult.deltaEntries.reduce((a, b) => Mux(a.cDelta >= b.cDelta, a, b))
-  val delta_list = readResult.deltaEntries.map(x => Mux(x.cDelta > current.prefetchMinCount, x.delta, 0.S))
+  val delta_list = readResult.deltaEntries.map(x => 
+            Mux(x.cDelta > current.prefetchMinCount,
+            Mux(x.delta === look_delta, (new DeltaEntry).apply(x.delta, strideIssues.asUInt),
+            (new DeltaEntry).apply(x.delta, 1.U)), (new DeltaEntry).apply()))
   val delta_list_checked = delta_list.map(x => 
-            Mux((current.block.asSInt + x).asUInt(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)
-            === current.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits), x, 0.S))
+            Mux((current.block.asSInt + x.delta).asUInt(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)
+            === current.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits), x, (new DeltaEntry).apply()))
 
   io.resp.bits.block := current.block
-  io.resp.bits.deltas := delta_list_checked
+  io.resp.bits.deltaEntries := delta_list_checked
   io.resp.bits.needT := current.needT
   io.resp.bits.source := current.source
   io.resp.valid := enprefetch
@@ -280,7 +292,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   }
 
   when(lastLookState && hit) {
-    val issued = delta_list_checked.map(a => Mux(a =/= 0.S, 1.U, 0.U)).reduce(_ +& _)
+    val issued = delta_list_checked.map(a => Mux(a.delta =/= 0.S, 1.U, 0.U)).reduce(_ +& _)
     when(issued =/= 0.U) {
       enprefetch := true.B
       val testOffset = (current.block.asSInt + maxEntry.delta).asUInt
@@ -293,6 +305,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
         newEntry.needT := current.needT
         newEntry.source := current.source
         newEntry.prefetchMinCount := current.prefetchMinCount + 1.U
+        newEntry.delta := maxEntry.delta
         recursionQueue.io.enq.valid := true.B
         recursionQueue.io.enq.bits := newEntry
       }
@@ -320,23 +333,34 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
     new SRAMTemplate(fTableEntry(), set = fTableEntries, way = 1, bypassWrite = true, shouldReset = true)
   )
 
-  val q = Module(new ReplaceableQueue(chiselTypeOf(io.req.bits), fTableQueueEntries))
+  val q = Module(new ReplaceableQueueV2(chiselTypeOf(io.req.bits), fTableQueueEntries))
   q.io.enq <> io.req //change logic to replace the tail entry
 
   val req = RegEnable(q.io.deq.bits, q.io.deq.fire())
-  val req_deltas = Reg(Vec(pTableDeltaEntries, SInt((blkOffsetBits + 1).W)))
-  val issue_finish = req_deltas.map(_ === 0.S).reduce(_ && _)
-  q.io.deq.ready := !inProcess || issue_finish
+  val req_deltas = Reg(Vec(pTableDeltaEntries, new DeltaEntry()))
+  val normal_issue_finish = req_deltas.map(_.delta === 0.S).reduce(_ && _)
+  val stride_issue_finish = WireDefault(true.B)
   when(q.io.deq.fire()) {
-    req_deltas := q.io.deq.bits.deltas
+    req_deltas := q.io.deq.bits.deltaEntries
   }
   
-
   val rData = Wire(fTableEntry())
   val hit = WireDefault(false.B)
   val enread = WireDefault(false.B)
-  val extract_delta = req_deltas.reduce((a, b) => Mux(a =/= 0.S, a, b))
-  val prefetchBlock = (req.block.asSInt + extract_delta).asUInt
+  val extract_delta = req_deltas.reduce((a, b) => Mux(a.delta =/= 0.S, a, b))
+  val prefetchBlock = WireDefault(0.U((pageAddrBits + blkOffsetBits).W))
+
+  val stride = RegInit(0.S((blkOffsetBits + 1).W))
+  val strideCnt = RegInit(0.U(4.W))
+  val strideBase = RegInit(0.U((pageAddrBits + blkOffsetBits).W))
+  val enableStride = q.io.deq.bits.deltaEntries.map(x => Mux(x.cDelta > 1.U, true.B, false.B)).reduce(_ || _)
+  when(q.io.deq.fire() && enableStride) {
+    val i : UInt = q.io.deq.bits.deltaEntries.indexWhere(x => x.cDelta > 1.U)
+    stride := q.io.deq.bits.deltaEntries(i).delta
+    strideCnt := q.io.deq.bits.deltaEntries(i).cDelta
+    strideBase := q.io.deq.bits.block
+    req_deltas(i) := (new DeltaEntry).apply(0.S, 0.U)
+  }
 
   fTable.io.r.req.valid := enread
   fTable.io.r.req.bits.setIdx := idx(prefetchBlock)
@@ -354,9 +378,26 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
   io.resp.bits.needT := RegNext(req.needT)
 
   when(inProcess) {
-    when(!issue_finish) {
-      enread := true.B
-      req_deltas := req_deltas.map(a => Mux(a === extract_delta, 0.S, a))
+    when(!normal_issue_finish || strideCnt > 0.U) {
+      when(strideCnt > 0.U) {
+        val testOffset = (strideBase.asSInt + stride).asUInt
+        when(testOffset(pageAddrBits + blkOffsetBits - 1, blkOffsetBits) === 
+        req.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)) {
+          when(strideCnt > 1.U) {
+            stride_issue_finish := false.B
+          }
+          enread := true.B
+          prefetchBlock := testOffset
+          strideBase := testOffset
+          strideCnt := strideCnt - 1.U
+        } .otherwise {
+          strideCnt := 0.U
+        }
+      } .otherwise{
+        enread := true.B
+        prefetchBlock := (req.block.asSInt + extract_delta.delta).asUInt
+        req_deltas := req_deltas.map(a => Mux(a.delta === extract_delta.delta, (new DeltaEntry).apply(0.S, 0.U), a))
+      }
     } .otherwise {
       when(!q.io.deq.fire()) {
         inProcess := false.B
@@ -368,6 +409,7 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
     }
   }
 
+  q.io.deq.ready := (!inProcess || normal_issue_finish) && stride_issue_finish
   io.evict.ready := true.B
 }
 
@@ -402,8 +444,8 @@ class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
 
   val req = Reg(new PrefetchReq)
   val req_valid = RegInit(false.B)
-  fTable.io.resp.ready := !req_valid
-  when(io.req.fire()) {
+  fTable.io.resp.ready := true.B
+  when(io.req.fire() && !fTable.io.resp.fire()) {
     req_valid := false.B
   }
   when(fTable.io.resp.fire()) {
@@ -435,6 +477,6 @@ class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
   XSPerfAccumulate(cacheParams, "recv_train", io.train.fire())
   XSPerfAccumulate(cacheParams, "recv_st", sTable.io.resp.fire())
   XSPerfAccumulate(cacheParams, "recv_pt", Mux(pTable.io.resp.fire(), 
-      pTable.io.resp.bits.deltas.map(a => Mux(a =/= 0.S, 1.U, 0.U)).reduce(_ +& _), 0.U))
+      pTable.io.resp.bits.deltaEntries.map(a => Mux(a.delta =/= 0.S, 1.U, 0.U)).reduce(_ +& _), 0.U))
   XSPerfAccumulate(cacheParams, "recv_ft", fTable.io.resp.fire())
 }
