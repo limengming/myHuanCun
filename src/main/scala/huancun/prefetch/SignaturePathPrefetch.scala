@@ -16,7 +16,7 @@ case class SPPParameters(
   pTableEntries: Int = 4096,
   pTableDeltaEntries: Int = 4,
   pTableQueueEntries: Int = 8,
-  strideIssues: Int = 5,
+  strideIssues: Int = 7,
   signatureBits: Int = 12,
   fTableEntries: Int = 16,
   fTableQueueEntries: Int = 5
@@ -115,7 +115,7 @@ class SignatureTable(implicit p: Parameters) extends SPPModule {
   println(s"sTagBits: ${sTagBits}")
   
   val sTable = Module(
-    new SRAMTemplate(sTableEntry(), set = sTableEntries, way = 1, shouldReset = true, singlePort = true)
+    new SRAMTemplate(sTableEntry(), set = sTableEntries, way = 1, bypassWrite = true, shouldReset = true)
   )
 
   val rAddr = io.req.bits.pageAddr
@@ -145,7 +145,7 @@ class SignatureTable(implicit p: Parameters) extends SPPModule {
   io.resp.bits.needT := RegNext(io.req.bits.needT)
   io.resp.bits.source := RegNext(io.req.bits.source)
 
-  io.req.ready := !sTable.io.w.req.fire()
+  io.req.ready := sTable.io.r.req.ready
 }
 
 class PatternTable(implicit p: Parameters) extends SPPModule {
@@ -235,6 +235,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
         Mux(x.delta === lastDelta, (new DeltaEntry).apply(lastDelta, x.cDelta + 1.U), x)) 
       //counter overflow
       when(readResult.count + 1.U === ((1.U << count.getWidth) - 1.U)) {
+        // deltaEntries := temp.map(x => Mux(x.cDelta =/= 0.U, (new DeltaEntry).apply(x.delta, x.cDelta - 1.U), x))
         deltaEntries := temp.map(x => (new DeltaEntry).apply(x.delta, x.cDelta >> 1.U))
       } .otherwise {
         deltaEntries := temp
@@ -429,7 +430,6 @@ class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
   val pageAddr = getPPN(oldAddr)
   val blkOffset = oldAddr(pageOffsetBits - 1, offsetBits)
 
-  // might be lack of prefetch requests
   io.train.ready := sTable.io.req.ready
   
   sTable.io.req.bits.pageAddr := pageAddr

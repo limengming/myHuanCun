@@ -18,6 +18,7 @@ class PrefetchReq(implicit p: Parameters) extends PrefetchBundle {
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
   val isBOP = Bool()
+  def addr = Cat(tag, set, 0.U(offsetBits.W))
 }
 
 class PrefetchResp(implicit p: Parameters) extends PrefetchBundle {
@@ -77,11 +78,14 @@ class PrefetchQueue(implicit p: Parameters) extends PrefetchModule {
   }
 
   when(io.enq.valid) {
-    queue(tail) := io.enq.bits
-    valids(tail) := !empty || !io.deq.ready // true.B
-    tail := tail + (!empty || !io.deq.ready).asUInt
-    when(full && !io.deq.ready) {
-      head := head + 1.U
+    val exist = queue.zipWithIndex.map{case (x, i) => Mux(valids(i) && x.addr === io.enq.bits.addr, true.B, false.B)}.reduce(_ || _)
+    when(!exist) {
+      queue(tail) := io.enq.bits
+      valids(tail) := !empty || !io.deq.ready // true.B
+      tail := tail + (!empty || !io.deq.ready).asUInt
+      when(full && !io.deq.ready) {
+        head := head + 1.U
+      }
     }
   }
 
@@ -115,6 +119,16 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
       pft.io.resp <> io.resp
       pft.io.evict <> io.evict
       pftQueue.io.enq <> pft.io.req
+      pipe.io.in <> pftQueue.io.deq
+      io.req <> pipe.io.out
+    case branch: PrefetchBranchParams => 
+      val hybrid_pfts = Module(new PrefetchBranch())
+      val pftQueue = Module(new PrefetchQueue)
+      val pipe = Module(new Pipeline(io.req.bits.cloneType, 1))
+      hybrid_pfts.io.train <> io.train
+      hybrid_pfts.io.resp <> io.resp
+      hybrid_pfts.io.evict <> io.evict
+      pftQueue.io.enq <> hybrid_pfts.io.req
       pipe.io.in <> pftQueue.io.deq
       io.req <> pipe.io.out
     case receiver: PrefetchReceiverParams =>
