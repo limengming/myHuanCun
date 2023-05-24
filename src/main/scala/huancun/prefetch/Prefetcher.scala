@@ -121,6 +121,16 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
       pftQueue.io.enq <> pft.io.req
       pipe.io.in <> pftQueue.io.deq
       io.req <> pipe.io.out
+    case stream: StreamerParameters =>
+      val pft = Module(new Streamer)
+      val pftQueue = Module(new PrefetchQueue)
+      val pipe = Module(new Pipeline(io.req.bits.cloneType, 1))
+      pft.io.train <> io.train
+      pft.io.resp <> io.resp
+      pft.io.evict <> io.evict
+      pftQueue.io.enq <> pft.io.req
+      pipe.io.in <> pftQueue.io.deq
+      io.req <> pipe.io.out
     case branch: PrefetchBranchParams => 
       val hybrid_pfts = Module(new PrefetchBranch())
       val pftQueue = Module(new PrefetchQueue)

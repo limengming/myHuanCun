@@ -50,7 +50,6 @@ class PrefetchBranch()(implicit p: Parameters) extends PrefetchModule {
   pf1.io.resp.bits.set := 0.U
   pf1.io.resp.valid := false.B
 
-
   pf1.io.req.ready := !pf2.io.req.valid
   pf2.io.req.ready := true.B
   io.req.valid := pf1.io.req.valid || pf2.io.req.valid

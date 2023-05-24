@@ -1,4 +1,3 @@
-// error when 000 signature occurs in pTable
 package huancun.prefetch
 
 import huancun.utils.SRAMTemplate
@@ -454,11 +453,11 @@ class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
     req.set := parseFullAddress(newAddr)._2
     req.needT := fTable.io.resp.bits.needT
     req.source := fTable.io.resp.bits.source
+    req.isBOP := false.B
     req_valid := true.B 
   }
   io.req.valid := req_valid
   io.req.bits := req
-  io.req.bits.isBOP := false.B
   io.resp.ready := true.B
 
   val pf_trace = Wire(new Trace)
