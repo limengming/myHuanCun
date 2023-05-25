@@ -13,8 +13,8 @@ import huancun.utils.XSPerfAccumulate
 case class StreamerParameters(
   sTableEntries: Int = 32,
   dist_within_fb: Int = 8,
-  dist_tw_home: Int = 3,
-  dist_fb_home: Int = 5,
+  dist_tw_home: Int = 5,
+  dist_fb_home: Int = 8,
   dist_demand_l2home: Int = 1,
   degree: Int = 5
 )
@@ -165,11 +165,12 @@ class StreamerTable(implicit p: Parameters) extends StreamerModule {
           tempValid := true.B
         }
       } .elsewhen(inWindowB(readResult, block_l)) {
-        updated.pendding := readResult.pendding + degree.asUInt
-        val (h, s) = updateHome(pState, block_l)
-        updated.l2_home := h
-        updated.state := s
-        tempValid := s =/= s_done
+        // just add LLC pendding
+        // updated.pendding := readResult.pendding + degree.asUInt
+        // val (h, s) = updateHome(pState, block_l)
+        // updated.l2_home := h
+        // updated.state := s
+        // tempValid := s =/= s_done
       } .elsewhen(inWindowC(readResult, block_l)) {
         updated.pendding := readResult.pendding + degree.asUInt
         tempValid := true.B
@@ -204,7 +205,7 @@ class StreamerTable(implicit p: Parameters) extends StreamerModule {
   when(hitForUpdate && (readResult.state === s_forward || readResult.state === s_backward) && !inWindowA(readResult, block_l)) {
     updated.farBack := false.B
   }
-  when(io.update.fire()) {
+  when(RegNext(io.update.fire())) {
     valids(idx(pageAddr_l)) := tempValid
   }
 
