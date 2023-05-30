@@ -2,7 +2,7 @@
 package huancun.prefetch
 
 import huancun.utils.SRAMTemplate
-import huancun.utils.ReplaceableQueue
+import huancun.utils.ReplaceableQueueV2
 import chipsalliance.rocketchip.config.Parameters
 import chisel3._
 import chisel3.util._
@@ -62,6 +62,7 @@ class SignatureTableResp(implicit p: Parameters) extends SPPBundle {
 
 class PatternTableResp(implicit p: Parameters) extends SPPBundle {
   val deltas = Vec(pTableDeltaEntries, SInt((blkOffsetBits + 1).W))
+  val send_to_l3 = Vec(pTableDeltaEntries, Bool())
   val block = UInt((pageAddrBits + blkOffsetBits).W)
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
@@ -107,7 +108,7 @@ class SignatureTable(implicit p: Parameters) extends SPPModule {
   println(s"sTagBits: ${sTagBits}")
   
   val sTable = Module(
-    new SRAMTemplate(sTableEntry(), set = sTableEntries, way = 1, shouldReset = true, singlePort = true)
+    new SRAMTemplate(sTableEntry(), set = sTableEntries, way = 1, bypassWrite = true, shouldReset = true)
   )
 
   val rAddr = io.req.bits.pageAddr
@@ -137,7 +138,7 @@ class SignatureTable(implicit p: Parameters) extends SPPModule {
   io.resp.bits.needT := RegNext(io.req.bits.needT)
   io.resp.bits.source := RegNext(io.req.bits.source)
 
-  io.req.ready := !sTable.io.w.req.fire()
+  io.req.ready := sTable.io.r.req.ready
 }
 
 class PatternTable(implicit p: Parameters) extends SPPModule {
@@ -157,7 +158,7 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
     new SRAMTemplate(pTableEntry(), set = pTableEntries, way = 1, bypassWrite = true, shouldReset = true)
   )
 
-  val q = Module(new ReplaceableQueue(chiselTypeOf(io.req.bits), pTableQueueEntries))
+  val q = Module(new ReplaceableQueueV2(chiselTypeOf(io.req.bits), pTableQueueEntries))
   q.io.enq <> io.req
   val req = q.io.deq.bits
 
@@ -184,13 +185,15 @@ class PatternTable(implicit p: Parameters) extends SPPModule {
   lastDelta := RegNext(readDelta)
   //set output
   val maxEntry = readResult.deltaEntries.reduce((a, b) => Mux(a.cDelta >= b.cDelta, a, b))
-  val delta_list = readResult.deltaEntries.map(x => Mux(x.cDelta > lookCount, x.delta, 0.S))
+  val delta_list = readResult.deltaEntries.map(x => Mux(x.cDelta >= (lookCount >> 1), x.delta, 0.S))
   val delta_list_checked = delta_list.map(x => 
             Mux((current.block.asSInt + x).asUInt(pageAddrBits + blkOffsetBits - 1, blkOffsetBits)
             === current.block(pageAddrBits + blkOffsetBits - 1, blkOffsetBits), x, 0.S))
+  val send_to_l3_list = readResult.deltaEntries.map(x => Mux(x.cDelta < lookCount, true.B, false.B))
 
   io.resp.bits.block := current.block
   io.resp.bits.deltas := delta_list_checked
+  io.resp.bits.send_to_l3 := send_to_l3_list
   io.resp.bits.needT := current.needT
   io.resp.bits.source := current.source
   io.resp.valid := enprefetch
@@ -290,6 +293,7 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
     val req = Flipped(DecoupledIO(new PatternTableResp))
     val evict = Flipped(DecoupledIO(new PrefetchEvict))
     val resp = DecoupledIO(new FilterTableResp)
+    val send_addr = ValidIO(UInt(64.W))
   })
 
   def idx(addr:      UInt) = addr(log2Up(fTableEntries) - 1, 0)
@@ -304,7 +308,7 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
     new SRAMTemplate(fTableEntry(), set = fTableEntries, way = 1, bypassWrite = true, shouldReset = true)
   )
 
-  val q = Module(new ReplaceableQueue(chiselTypeOf(io.req.bits), fTableQueueEntries))
+  val q = Module(new ReplaceableQueueV2(chiselTypeOf(io.req.bits), fTableQueueEntries))
   q.io.enq <> io.req //change logic to replace the tail entry
 
   val req = RegEnable(q.io.deq.bits, q.io.deq.fire())
@@ -320,6 +324,8 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
   val hit = WireDefault(false.B)
   val enread = WireDefault(false.B)
   val extract_delta = req_deltas.reduce((a, b) => Mux(a =/= 0.S, a, b))
+  val index : UInt = req_deltas.indexWhere(a => a === extract_delta)
+  val send_to_l3 = req.send_to_l3(index)
   val prefetchBlock = (req.block.asSInt + extract_delta).asUInt
 
   fTable.io.r.req.valid := enread
@@ -332,10 +338,13 @@ class FilterTable(implicit p: Parameters) extends SPPModule {
   fTable.io.w.req.bits.data(0).valid := true.B
   fTable.io.w.req.bits.data(0).tag := tag(RegNext(prefetchBlock))
 
-  io.resp.valid := !hit && RegNext(fTable.io.r.req.fire())
+  io.resp.valid := !hit && RegNext(fTable.io.r.req.fire()) && !send_to_l3
   io.resp.bits.prefetchBlock := RegNext(prefetchBlock)
   io.resp.bits.source := RegNext(req.source)
   io.resp.bits.needT := RegNext(req.needT)
+
+  io.send_addr.valid := !hit && RegNext(fTable.io.r.req.fire()) && send_to_l3
+  io.send_addr.bits := RegNext(prefetchBlock)
 
   when(inProcess) {
     when(!issue_finish) {
@@ -361,6 +370,7 @@ class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
     val req = DecoupledIO(new PrefetchReq) //issue to next-level cache
     val resp = Flipped(DecoupledIO(new PrefetchResp)) //fill request from the next-level cache, using this to update filter
     val evict = Flipped(DecoupledIO(new PrefetchEvict))
+    val send_addr = ValidIO(UInt(64.W))
   })
 
   val sTable = Module(new SignatureTable)
@@ -383,11 +393,12 @@ class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
   pTable.io.req <> sTable.io.resp //to detail
   pTable.io.resp <> fTable.io.req
   fTable.io.evict <> io.evict
+  io.send_addr <> fTable.io.send_addr
 
   val req = Reg(new PrefetchReq)
   val req_valid = RegInit(false.B)
-  fTable.io.resp.ready := !req_valid
-  when(io.req.fire()) {
+  fTable.io.resp.ready := true.B
+  when(io.req.fire() && !fTable.io.resp.fire()) {
     req_valid := false.B
   }
   when(fTable.io.resp.fire()) {
@@ -396,11 +407,11 @@ class SignaturePathPrefetch(implicit p: Parameters) extends SPPModule {
     req.set := parseFullAddress(newAddr)._2
     req.needT := fTable.io.resp.bits.needT
     req.source := fTable.io.resp.bits.source
+    req.isBOP := false.B
     req_valid := true.B 
   }
   io.req.valid := req_valid
   io.req.bits := req
-  io.req.bits.isBOP := false.B
   io.resp.ready := true.B
 
   val pf_trace = Wire(new Trace)
