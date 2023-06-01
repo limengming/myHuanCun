@@ -35,6 +35,8 @@ class QueueIOV2[T <: Data](
     * @group Signals
     */
   val deq = Flipped(DeqIOV2(gen))
+
+  val empty = Output(Bool())
 }
 
 /** A hardware module implementing a Queue
@@ -68,6 +70,7 @@ class ReplaceableQueueV2[T <: Data](
   val tail = RegInit(0.U(idxWidth.W))
   val empty = head === tail && !valids.last
   val full = head === tail && valids.last
+  io.empty := empty
 
   when(!empty && io.deq.ready) {
     valids(head) := false.B
